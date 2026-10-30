@@ -1,11 +1,20 @@
 #!/usr/bin/env Rscript
 # Single-cell RNA-seq
-# Usage: edit cfg below, then run Rscript scrna_pipeline.R
+# Revised 2026-10-22. Default: reproduce and evaluate the manuscript cell populations.
+# Annotation combines canonical markers, cluster DE profiles and eGFP context (Fig. S9C).
+# eGFP is supporting annotation evidence, NOT a per-cell inclusion threshold.
+# Upstream reporter quantification: custom FASTA/GTF + Cell Ranger (7.2.0 in Methods).
+# Reference-build sequences/commands are not reconstructed by this downstream script.
+# Rscript TMEM41B_scRNAseq_analysis_revised_20261022.R /absolute/project/root [--quick]
+# Outputs: project/results_TMEM41B_review_20261022 (never overwrites submission inputs).
+# --quick: annotation, QC, raw reporter summaries and plot reproduction only.
+# Default additionally runs DE markers, SMC reclustering and parameter sensitivity.
+# --rebuild: corrected-QC, reporter-excluded discovery pipeline (new clusters need review).
 # All relative paths resolve from the working directory, not the script directory.
 # Dependencies: Seurat (supporting leiden_method='leidenbase'), Matrix, igraph,
 #       ggplot2, future, leidenbase. Packages are not installed or upgraded automatically.
 # Retains reference reconstruction, Louvain comparison, multi-seed checks, and marker export.
-# Reference embedding/marker comparisons are optional; no fixed cell counts or project-specific paths.
+# Generic reconstruction functions precede project-specific reproducibility functions.
 
 cfg <- list(
   samples = data.frame(
@@ -22,24 +31,24 @@ cfg <- list(
   reference_markers = NULL,                  # Optional: TSV with cluster/gene/avg_log2FC
   use_archived_features = FALSE,             # Requires archive_rds when TRUE
   require_reference_qc_match = FALSE,        # Require exact agreement between QC-passing and reference cell sets
-  qc = list(min_cells = 3, min_features = 250, feature_min = 200,
+  qc = list(min_cells = 3, min_features = 250, feature_min = 250,
             feature_max = 7500, count_min = 100, mt_max = 25,
             mt_pattern = NULL, ribo_pattern = NULL),
   nfeatures = 2000, npcs = 50, anchor_dims = 1:20, dims = 1:40,
   seed = 42, tsne_seed = 1, tsne_perplexity = 30,
   resolutions = seq(0.3, 1.1, 0.1), seeds = 42:46,
   preferred_resolution = 0.7, baseline_resolution = 0.7,
-  selection = 'strict',                      # strict or similarity
-  # strict: connectivity + stability + marker coherence; similarity: no hard stability threshold.
-  # Rank by reference ARI when available; otherwise by stability and marker coherence.
+  selection = 'strict',                      # revised marker-independent rule
+  # Revised selection uses connectivity and seed stability ONLY.
+  # Marker coherence and reference similarity are diagnostic outputs, never selection gates.
   min_seed_ari = 0.85, coherence_tolerance = 0.05,
   marker_panels = NULL,                      # Custom named list; NULL uses the example panels below
   annotation_min_cells = 20, annotation_margin = 0.15,
   annotation_agreement = 0.5,
   make_plots = TRUE, plot_genes = character(), raw_tsne_diagnostic = FALSE,
-  marker_assays = c('RNA', 'integrated'),
+  marker_assays = c('RNA'),
   marker_min_pct = 0.25, marker_logfc = 0.25,
-  marker_p_column = 'p_val', marker_p_cutoff = 0.01, # Original scripts used unadjusted P values
+  marker_p_column = 'p_val_adj', marker_p_cutoff = 0.05, # Seurat Bonferroni, NOT BH FDR
   marker_top_n = c(10, 20, 50, 100)
 )
 
@@ -162,14 +171,19 @@ rebuild <- function(cfg, reference) {
     if (!length(keep)) stop('No cells retained for sample: ', s$sample)
     x <- subset(x, cells = keep)
     x <- NormalizeData(x, scale.factor = 10000, verbose = FALSE)
-    objects[[i]] <- FindVariableFeatures(x, selection.method = 'vst',
+    # Reporters remain in RNA counts for auditing but are absent from feature modeling.
+    endogenous <- setdiff(rownames(x), cfg$reporter_features)
+    temp <- FindVariableFeatures(subset(x, features = endogenous), selection.method = 'vst',
       nfeatures = cfg$nfeatures, verbose = FALSE)
+    VariableFeatures(x) <- VariableFeatures(temp); rm(temp)
+    objects[[i]] <- x
   }
   write_tsv(do.call(rbind, audits), 'qc_audit', cfg)
   archive <- if (!is.null(cfg$archive_rds)) readRDS(cfg$archive_rds) else NULL
   features <- if (cfg$use_archived_features) {
     archive@commands$FindIntegrationAnchors@params$anchor.features
   } else SelectIntegrationFeatures(objects, nfeatures = cfg$nfeatures)
+  features <- setdiff(features, cfg$reporter_features)
   if (!length(features) || !all(features %in% Reduce(intersect, lapply(objects, rownames))))
     stop('Integration features are empty or are not present in every sample.')
   set.seed(cfg$seed)
@@ -181,6 +195,7 @@ rebuild <- function(cfg, reference) {
   x <- ScaleData(x, features = rownames(x), verbose = FALSE)
   pca_features <- if (cfg$use_archived_features)
     archive@commands$RunPCA.integrated@params$features else VariableFeatures(x)
+  pca_features <- setdiff(pca_features, cfg$reporter_features)
   if (!length(pca_features) || !all(pca_features %in% rownames(x))) stop('Invalid PCA features.')
   if (cfg$npcs >= min(length(pca_features), ncol(x))) stop('Insufficient cells or features. Reduce npcs.')
   VariableFeatures(x) <- pca_features
@@ -267,9 +282,7 @@ select_clusters <- function(x, evidence, cfg) {
       marker_coherence = sum(apply(composition, 1, max)) / sum(composition))
   }
   ev <- do.call(rbind, evaluations)
-  ev$eligible <- ev$disconnected_across_seeds == 0 &
-    ev$marker_coherence >= max(ev$marker_coherence) - cfg$coherence_tolerance
-  if (cfg$selection == 'strict') ev$eligible <- ev$eligible & ev$mean_seed_ARI >= cfg$min_seed_ari
+  ev$eligible <- ev$disconnected_across_seeds == 0 & ev$mean_seed_ARI >= cfg$min_seed_ari
   ev$selection_strategy <- cfg$selection; ev$selected <- FALSE
   write_tsv(assignments, 'candidate_assignments', cfg)
   write_tsv(do.call(rbind, pairs), 'seed_pairwise_ari', cfg)
@@ -277,9 +290,7 @@ select_clusters <- function(x, evidence, cfg) {
   write_tsv(ev, 'resolution_evaluation', cfg)
   if (!any(ev$eligible)) stop('No candidate passed selection. Inspect the evaluation table; thresholds are not relaxed automatically.')
   eligible <- ev[ev$eligible, ]
-  ranking <- if (!is.null(reference)) order(-eligible$reference_ARI,
-    abs(eligible$resolution - cfg$preferred_resolution)) else order(-eligible$mean_seed_ARI,
-    -eligible$marker_coherence, abs(eligible$resolution - cfg$preferred_resolution))
+  ranking <- order(-eligible$mean_seed_ARI, abs(eligible$resolution - cfg$preferred_resolution), eligible$resolution)
   chosen <- eligible[ranking[1], ]; lab <- candidates[[chosen$candidate]]
   ev$selected <- ev$candidate == chosen$candidate
   write_tsv(ev, 'resolution_evaluation', cfg)
@@ -383,6 +394,7 @@ export_plots <- function(x, result, cfg) {
   if (cfg$raw_tsne_diagnostic) {
     raw <- CreateSeuratObject(GetAssayData(x, assay = 'RNA', layer = 'counts'), meta.data = x[[]])
     raw <- NormalizeData(raw, verbose = FALSE)
+    raw <- subset(raw, features = setdiff(rownames(raw), cfg$reporter_features))
     raw <- FindVariableFeatures(raw, nfeatures = cfg$nfeatures, verbose = FALSE)
     raw <- ScaleData(raw, verbose = FALSE)
     raw <- RunPCA(raw, npcs = cfg$npcs, seed.use = cfg$seed, verbose = FALSE)
@@ -436,7 +448,7 @@ export_markers <- function(x, cfg) {
     }
     exported[[assay]] <- m
   }
-  # Use integrated markers for reference comparisons; prioritize RNA markers for biological interpretation.
+  # Optional integrated-marker comparison only; biological interpretation uses RNA markers.
   if (!is.null(cfg$reference_markers) && 'reference_cluster' %in% colnames(x[[]]) &&
       'integrated' %in% names(exported)) {
     old <- read.delim(cfg$reference_markers)
@@ -491,7 +503,7 @@ main <- function(cfg) {
   suppressPackageStartupMessages(library(Seurat))
   if (!'leiden_method' %in% names(formals(getS3method('FindClusters', 'default'))))
     stop('This Seurat version does not support leiden_method. Use a version with the leidenbase backend.')
-  stopifnot(cfg$species %in% c('mouse', 'human'), cfg$selection %in% c('strict', 'similarity'),
+  stopifnot(cfg$species %in% c('mouse', 'human'), identical(cfg$selection, 'strict'),
     cfg$cell_naming %in% c('sample_prefix', 'index_suffix'),
     all(c('sample', 'group', 'path') %in% names(cfg$samples)), nrow(cfg$samples) >= 2,
     !anyNA(cfg$samples), !anyDuplicated(cfg$samples$sample),
@@ -523,5 +535,286 @@ main <- function(cfg) {
   message('Analysis complete. Results: ', normalizePath(cfg$output_dir))
 }
 
-# source() loads configuration and functions only; direct execution runs the full pipeline.
-if (sys.nframe() == 0L) main(cfg)
+
+
+# ---------------- Revision modules ----------------
+# Historical manuscript IDs are used ONLY with their archived cell identities.
+# They must never be transferred by numeric ID to a newly clustered object.
+cfg$reporter_features <- c('gene-GFP','gene-RFP','GFP','eGFP','EGFP','RFP','tdTomato')
+revision_write <- function(d, name, out) {
+  write.table(d, file.path(out,paste0(name,'.tsv')),sep='\t',quote=FALSE,row.names=FALSE,na='NA')
+}
+revision_plot <- function(p,name,out,w=12,h=7) {
+  ggplot2::ggsave(file.path(out,paste0(name,'.pdf')),p,width=w,height=h,limitsize=FALSE)
+}
+# Descriptive cluster markers; cells are not independent mouse replicates.
+# Retain all returned tests, including nonsignificant rows, plus an adjusted-P top table.
+revision_markers <- function(x, field, prefix, out) {
+  DefaultAssay(x)<-'RNA';Idents(x)<-field
+  all<-lapply(levels(Idents(x)),function(k){
+    message(prefix,' markers ',k)
+    if(sum(Idents(x)==k)<3 || sum(Idents(x)!=k)<3) return(NULL)
+    m<-FindMarkers(x,ident.1=k,only.pos=TRUE,min.pct=.25,logfc.threshold=.25,
+      test.use='wilcox',random.seed=42,verbose=FALSE)
+    m$gene<-rownames(m);m$cluster<-rep(k,nrow(m));m
+  })
+  m<-do.call(rbind,all);revision_write(m,paste0(prefix,'_markers_all_tests'),out)
+  ok<-m[!is.na(m$p_val_adj)&m$p_val_adj<.05,,drop=FALSE]
+  top<-do.call(rbind,lapply(split(ok,ok$cluster),function(z)head(z[order(-z$avg_log2FC,z$gene),],10)))
+  revision_write(top,paste0(prefix,'_markers_top10_Bonferroni05'),out)
+  genes<-unique(top$gene)
+  if(length(genes)) {
+    # Split the large panel into readable pages, retaining original cluster labels.
+    for(i in seq_along(split(genes,ceiling(seq_along(genes)/30)))) {
+      g<-split(genes,ceiling(seq_along(genes)/30))[[i]]
+      revision_plot(DotPlot(x,features=g,assay='RNA',group.by=field)+RotatedAxis(),
+        paste0(prefix,'_DE_marker_panel_',i),out,14,8)
+    }
+  }
+  invisible(m)
+}
+revision_qc <- function(x,field,prefix,out) {
+  cts<-GetAssayData(x,assay='RNA',layer='counts')
+  mt<-grep('^mt-',rownames(cts),value=TRUE)
+  if(!length(mt))stop('No mouse mitochondrial genes found.')
+  d<-data.frame(cell=colnames(x),cluster=as.character(x[[field]][,1]),
+    sample=x$Sample,group=x$Group,nCount=Matrix::colSums(cts),nFeature=Matrix::colSums(cts>0),
+    percent_mt=100*Matrix::colSums(cts[mt,,drop=FALSE])/Matrix::colSums(cts))
+  d$corrected_qc_pass<-d$nFeature>250 & d$nFeature<7500 & d$nCount>100 & d$percent_mt<25
+  revision_write(d,paste0(prefix,'_cell_QC'),out)
+  sets<-split(seq_len(nrow(d)),d$cluster)
+  summary<-do.call(rbind,lapply(names(sets),function(k){i<-sets[[k]];z<-d[i,];n<-table(factor(z$sample,levels=unique(d$sample)))
+    data.frame(cluster=k,n=nrow(z),median_UMI=median(z$nCount),median_genes=median(z$nFeature),
+      median_mt=median(z$percent_mt),mt_ge25=sum(z$percent_mt>=25),qc_fail=sum(!z$corrected_qc_pass),
+      samples_present=sum(n>0),samples_ge10=sum(n>=10),max_sample_fraction=max(n)/sum(n))}))
+  revision_write(summary,paste0(prefix,'_cluster_QC'),out)
+  tab<-as.data.frame(table(cluster=d$cluster,sample=d$sample));names(tab)[3]<-'cells'
+  tab$fraction_of_cluster<-tab$cells/as.numeric(table(d$cluster)[as.character(tab$cluster)])
+  tab$fraction_of_sample<-tab$cells/as.numeric(table(d$sample)[as.character(tab$sample)])
+  revision_write(tab,paste0(prefix,'_cluster_sample_contribution'),out)
+  for(v in c('nCount','nFeature','percent_mt')) revision_plot(
+    ggplot2::ggplot(d,ggplot2::aes(x=factor(cluster,levels=sort(unique(as.integer(cluster)))),y=.data[[v]]))+
+      ggplot2::geom_boxplot(outlier.shape=NA)+ggplot2::facet_wrap(~sample,ncol=2)+
+      ggplot2::theme_bw()+ggplot2::labs(x='Original cluster',y=v),paste0(prefix,'_QC_',v),out,13,8)
+  invisible(d)
+}
+# Rebuild SMC PCA and graph on the historically selected cells; do not gate on reporter.
+# Historical state IDs may be reapplied only after exact cell-wise cluster agreement.
+revision_smc_recluster <- function(x, archived, out) {
+  s<-subset(x,cells=colnames(x)[x$celltype_customer=='Smooth muscle cell'])
+  stopifnot(setequal(colnames(s),colnames(archived)))
+  DefaultAssay(s)<-'integrated';set.seed(42)
+  s<-RunPCA(s,npcs=10,seed.use=42,verbose=FALSE)
+  s<-FindNeighbors(s,dims=1:10,k.param=20,prune.SNN=1/15,nn.method='annoy',n.trees=50,
+    annoy.metric='euclidean',l2.norm=FALSE,verbose=FALSE)
+  lab<-run_leiden(s[['integrated_snn']],1,42)
+  lev<-names(sort(table(lab),decreasing=TRUE));mapped<-unname(setNames(as.character(seq_along(lev)-1),lev)[lab])
+  truth<-as.character(archived$smc_leiden)[match(colnames(s),colnames(archived))]
+  revision_write(data.frame(cell=colnames(s),recomputed=mapped,archived=truth),'SMC_recluster_crosscheck',out)
+  revision_write(data.frame(ARI=ari(mapped,truth),exact=identical(mapped,truth)), 'SMC_recluster_validation',out)
+  if(!identical(mapped,truth))stop('SMC rerun differs: do not transplant historical state labels.')
+  invisible(s)
+}
+# PC/k sensitivity uses no marker score or labels in graph construction or clustering.
+# Comparison to historical clusters is a diagnostic, not an optimization objective.
+revision_sensitivity <- function(x,field,prefix,pcs,ks,resolutions,out) {
+  DefaultAssay(x)<-'integrated';truth<-as.character(x[[field]][,1]);ans<-maps<-list();i<-0L
+  for(pc in pcs)for(k in ks){
+    set.seed(42);z<-FindNeighbors(x,dims=seq_len(pc),k.param=k,prune.SNN=1/15,
+      nn.method='annoy',n.trees=50,annoy.metric='euclidean',l2.norm=FALSE,verbose=FALSE)
+    for(r in resolutions){i<-i+1L;message(prefix,' sensitivity ',pc,' ',k,' ',r)
+      labs<-lapply(42:46,function(seed)run_leiden(z[['integrated_snn']],r,seed))
+      pairs<-combn(1:5,2);av<-apply(pairs,2,function(j)ari(labs[[j[1]]],labs[[j[2]]]))
+      lab<-labs[[1]];tb<-table(truth,lab)
+      maps[[i]]<-do.call(rbind,lapply(rownames(tb),function(old){v<-tb[old,];best<-which.max(v)
+        data.frame(PC=pc,k=k,resolution=r,original_cluster=old,matched_cluster=colnames(tb)[best],
+          Jaccard=v[best]/(sum(v)+sum(tb[,best])-v[best]),recall=v[best]/sum(v))}))
+      ans[[i]]<-data.frame(PC=pc,k=k,resolution=r,clusters=length(unique(lab)),
+        ARI_to_manuscript=ari(lab,truth),mean_seed_ARI=mean(av),min_seed_ARI=min(av))
+      revision_write(do.call(rbind,ans),paste0(prefix,'_parameter_sensitivity'),out)
+      revision_write(do.call(rbind,maps),paste0(prefix,'_cluster_sensitivity'),out)
+    }
+  }
+}
+revision_reporter <- function(x,s,out) {
+  cts<-GetAssayData(x,assay='RNA',layer='counts');stopifnot('gene-GFP'%in%rownames(cts))
+  d<-data.frame(cell=colnames(x),sample=x$Sample,group=x$Group,global_cluster=x$leiden_global,
+    population=as.character(x$celltype_customer),GFP=as.numeric(cts['gene-GFP',]),
+    UMI=Matrix::colSums(cts),genes=Matrix::colSums(cts>0))
+  ix<-match(colnames(s),d$cell);stopifnot(!anyNA(ix));d$population[ix]<-as.character(s$celltype_smc)
+  d$GFP_per10000<-10000*d$GFP/d$UMI
+  revision_write(d,'reporter_per_cell',out)
+  pop<-c('Contractile SMC','Fibroblast like SMC1','Fibroblast like SMC2','Fibroblast like SMC3','fibroblast')
+  z<-d[d$population%in%pop,];z$population<-factor(z$population,levels=pop)
+  summary<-do.call(rbind,lapply(split(z,interaction(z$sample,z$population,drop=TRUE)),function(a){
+    data.frame(sample=a$sample[1],group=a$group[1],population=as.character(a$population[1]),n=nrow(a),
+      median_GFP=median(a$GFP),mean_GFP=mean(a$GFP),q90_GFP=unname(quantile(a$GFP,.9)),
+      pct_ge1=100*mean(a$GFP>=1),pct_ge2=100*mean(a$GFP>=2),pct_ge5=100*mean(a$GFP>=5),
+      median_UMI=median(a$UMI),median_genes=median(a$genes),
+      rho_GFP_UMI=suppressWarnings(cor(a$GFP,a$UMI,method='spearman')),
+      rho_GFP_genes=suppressWarnings(cor(a$GFP,a$genes,method='spearman')))
+  }))
+  revision_write(summary,'reporter_by_sample_population',out)
+  # Thresholds are descriptive sensitivity checks, not validated lineage gates.
+  revision_plot(ggplot2::ggplot(z,ggplot2::aes(population,log1p(GFP),fill=population))+
+    ggplot2::geom_boxplot(outlier.shape=NA)+ggplot2::facet_wrap(~sample,ncol=2)+
+    ggplot2::theme_bw()+ggplot2::theme(axis.text.x=ggplot2::element_text(angle=30,hjust=1),legend.position='none')+
+    ggplot2::labs(y='log(1 + raw GFP UMI)',x=NULL),'GFP_raw_distribution',out,14,9)
+  for(v in c('UMI','genes')) revision_plot(ggplot2::ggplot(z,ggplot2::aes(x=.data[[v]],y=GFP,color=population))+
+    ggplot2::geom_point(size=.3,alpha=.2)+ggplot2::scale_x_log10()+ggplot2::scale_y_continuous(trans='log1p')+
+    ggplot2::facet_wrap(~sample,ncol=2)+ggplot2::theme_bw(),paste0('GFP_vs_',v),out,13,8)
+}
+# Conservative analysis labels are separate from historical display labels.
+# Exclude the erythroid-enriched/mixed global cluster 14, do not silently rename it SMC.
+# This fixed-label sensitivity is NOT a substitute for re-integration/reclustering after QC.
+revision_review <- function(x,s,out) {
+  q<-read.delim(file.path(out,'SMC_cell_QC.tsv'))
+  pass<-q$corrected_qc_pass[match(colnames(s),q$cell)]
+  d<-data.frame(cell=colnames(s),sample=s$Sample,group=s$Group,global_cluster=s$leiden_global,
+    smc_cluster=s$smc_leiden,historical_state=s$celltype_smc,corrected_qc_pass=pass)
+  d$exclude_erythroid_mixed<-as.character(d$global_cluster)=='14'
+  d$analysis_label<-as.character(d$historical_state)
+  d$analysis_label[d$exclude_erythroid_mixed]<-'Excluded_erythroid_enriched_or_mixed'
+  d$analysis_label[!d$exclude_erythroid_mixed & as.character(d$smc_cluster)=='4']<-'SMC_high_mt_state_unresolved'
+  d$analysis_label[as.character(d$smc_cluster)=='15']<-'Matrix_like_low_complexity_candidate'
+  d$analysis_label[as.character(d$smc_cluster)=='17']<-'Cycling_matrix_SMC_like_candidate'
+  revision_write(d,'SMC_annotation_review_and_exclusions',out)
+  modes<-list(historical=rep(TRUE,nrow(d)),exclude_global14=!d$exclude_erythroid_mixed,
+    corrected_QC_and_exclude14=pass & !d$exclude_erythroid_mixed,
+    conservative_exclude_low_complexity=pass & !d$exclude_erythroid_mixed & !as.character(d$smc_cluster)%in%c('3','15'))
+  a<-do.call(rbind,lapply(names(modes),function(mode){
+    z<-d[modes[[mode]],];tb<-as.data.frame(table(sample=factor(z$sample,levels=unique(d$sample)),
+      historical_state=factor(z$historical_state,levels=unique(d$historical_state))))
+    names(tb)[3]<-'cells';tb$mode<-mode
+    tb$fraction_within_retained_SMC<-tb$cells/as.numeric(table(z$sample)[as.character(tb$sample)])
+    tb
+  }))
+  revision_write(a,'SMC_fixed_label_exclusion_sensitivity',out)
+  cross<-as.data.frame(table(global_cluster=s$leiden_global,SMC_cluster=s$smc_leiden))
+  revision_write(cross,'global_to_SMC_crosswalk',out)
+}
+
+
+# Final manual maps are distinct from automated provisional marker scores.
+# These preserve the manuscript labels for reproducibility, not evidence that every
+# historical state is equally secure. Independent DE/QC diagnostics remain visible.
+revision_annotation <- function(x,s,out) {
+  map<-unique(data.frame(cluster=as.character(s$smc_leiden),state=as.character(s$celltype_smc)))
+  map<-map[order(as.integer(map$cluster)),]
+  panels<-list('Contractile SMC'=c('Cnn1','Myh11','Tagln','Tpm1'),
+    'Proliferating SMC'=c('Ccnl2','Ccnt2','Malat1'),
+    'Synthetic SMC'=c('Mfap5','Vcan','Gsn'),
+    'Fibroblast like SMC1'=c('Dcn','Serpinh1','Lum'),
+    'Fibroblast like SMC2'=c('Dcn','Serpinh1','Lum'),
+    'Fibroblast like SMC3'=c('Dcn','Serpinh1','Lum'))
+  map$S9F_panel<-vapply(map$state,function(k)paste(panels[[k]],collapse=';'),character(1))
+  map$annotation_method<-'manual state map; marker expression with eGFP context'
+  map$additional_validation<-'RNA cluster DE, QC and sample contribution; Mki67/Top2a/Ube2c for cycling'
+  revision_write(map,'SMC_state_annotation_criteria',out)
+  selected<-as.character(x$celltype_customer)=='Smooth muscle cell'
+  stopifnot(setequal(colnames(x)[selected],colnames(s)))
+  revision_write(data.frame(cell=colnames(x),global_cluster=x$leiden_global,
+    final_annotation=x$celltype_customer,selected_for_SMC=selected,
+    selection_rule='final SMC annotation; no individual GFP UMI or normalized-expression gate'),
+    'SMC_selection_rule',out)
+  # Record the source figure separately from the quantitative reporter analysis.
+  revision_write(data.frame(item=c('S9C source','reporter feature','quantification','positivity gate',
+      'annotation','historical resolution selection','revised selection'),
+    detail=c('240624_new_result/1/tsne_GFP.pdf','gene-GFP in RNA assay',
+      'custom FASTA/GTF + Cell Ranger; version 7.2.0 reported in Supplemental Methods',
+      'none for SMC extraction; raw-count thresholds are descriptive sensitivity checks',
+      'marker scores are provisional; final cluster maps reflect manual review with eGFP and markers',
+      'connectivity and marker-coherence eligibility; reference ARI ranking in similarity mode',
+      'graph connectivity and seed stability only; markers and reference labels are diagnostics')),
+    'method_provenance',out)
+}
+revision_S9C <- function(x,out) {
+  DefaultAssay(x)<-'RNA'
+  stopifnot('gene-GFP'%in%rownames(x[['RNA']]))
+  # Continuous log-normalized expression, not binary lineage classification.
+  revision_plot(FeaturePlot(x,features='gene-GFP',reduction='tsne',split.by='Group',
+    raster=FALSE),'S9C_eGFP_continuous_expression',out,12,6)
+}
+
+revision_audit <- function(root,out,full=TRUE) {
+  for(p in c('Seurat','Matrix','igraph','ggplot2','leidenbase'))if(!requireNamespace(p,quietly=TRUE))stop('Missing package ',p)
+  suppressPackageStartupMessages(library(Seurat));future::plan('sequential');set.seed(42)
+  dir.create(out,recursive=TRUE,showWarnings=FALSE)
+  on.exit(writeLines(capture.output(sessionInfo()),file.path(out,'sessionInfo.txt')),add=TRUE)
+  x<-readRDS(file.path(root,'240630_new/3/scRNA_customer_Leiden.rds'))
+  s<-readRDS(file.path(root,'240724_new/2/scRNA_smc_240724_new.rds'))
+  stopifnot(ncol(x)==27592,ncol(s)==19946,length(unique(x$leiden_global))==23,length(unique(s$smc_leiden))==18)
+  # Provenance, not a new assertion of biological validation.
+  gm<-read.delim(file.path(root,'240630_new/source/customer_mapping.tsv'))
+  sm<-read.delim(file.path(root,'240724_new/tables/customer_SMC_mapping.tsv'))
+  stopifnot(all(as.character(x$celltype_customer)==gm$customer_celltype[match(x$leiden_global,gm$cluster)]),
+    all(as.character(s$celltype_smc)==sm$celltype_smc[match(s$smc_leiden,sm$smc_leiden)]))
+  revision_write(gm,'global_annotation_mapping',out);revision_write(sm,'SMC_annotation_mapping',out)
+  revision_write(data.frame(cell=colnames(x),original_cluster=x$leiden_global,
+    provisional=x$celltype_provisional,reviewed=x$celltype_reviewed,manuscript=x$celltype_customer),'annotation_provenance',out)
+  revision_qc(x,'leiden_global','global',out);revision_qc(s,'smc_leiden','SMC',out)
+  revision_reporter(x,s,out)
+  revision_annotation(x,s,out)
+  revision_S9C(x,out)
+  revision_review(x,s,out)
+  features<-list(integration=x@commands$FindIntegrationAnchors@params$anchor.features,
+    global_PCA=rownames(Loadings(x[['pca']])),SMC_PCA=rownames(Loadings(s[['pca']])))
+  audit<-do.call(rbind,lapply(names(features),function(n)data.frame(stage=n,reporter=cfg$reporter_features,
+    included=cfg$reporter_features%in%features[[n]])))
+  revision_write(audit,'reporter_feature_inclusion',out)
+  ev<-read.delim(file.path(root,'240624_new/tables/resolution_evaluation.tsv'))
+  ev$marker_free_eligible<-ev$disconnected_across_seeds==0 & ev$mean_seed_ARI>=.85
+  ev$marker_free_selected<-FALSE
+  good<-which(ev$marker_free_eligible)
+  if(length(good)){j<-good[order(-ev$mean_seed_ARI[good],abs(ev$resolution[good]-.7))][1];ev$marker_free_selected[j]<-TRUE}
+  revision_write(ev,'resolution_selection_audit',out)
+  DefaultAssay(x)<-'RNA';DefaultAssay(s)<-'RNA'
+  gp<-c('Myh11','Cnn1','Tagln','Acta2','Tpm1','Dcn','Timp1','Lum','Pdgfra','Col1a1','Dpt',
+    'Pecam1','Cdh5','Adgre1','Cd68','Cd3d','Cd3e','Cd79a','Cd19','Plp1','Sox10','Flt3','Itgax',
+    'Hbb-bs','Hba-a1','Alas2','Jchain','Mzb1','Il1rl1','Gata3','gene-GFP','gene-RFP')
+  sp<-c('Myh11','Cnn1','Tagln','Tpm1','Dcn','Timp1','Serpinh1','Lum','Mfap5','Vcan','Gsn',
+    'Ccnl2','Ccnt2','Malat1','Mki67','Top2a','Ube2c','Pdgfra','gene-GFP','gene-RFP')
+  for(level in c('global','SMC')) {
+    o<-if(level=='global')x else s;field<-if(level=='global')'leiden_global' else 'smc_leiden'
+    genes<-intersect(if(level=='global')gp else sp,rownames(o[['RNA']]))
+    p<-DotPlot(o,features=genes,group.by=field,assay='RNA')+RotatedAxis()
+    revision_plot(p,paste0(level,'_original_cluster_markers'),out,16,9)
+    revision_write(p$data,paste0(level,'_original_cluster_markers'),out)
+  }
+  # Reuse already-computed global RNA tests; provenance is recorded below.
+  m<-read.delim(file.path(root,'240624_new/tables/markers_RNA_all.tsv'))
+  revision_write(m,'global_archived_RNA_markers_p001',out)
+  ok<-m[!is.na(m$p_val_adj)&m$p_val_adj<.05,]
+  top<-do.call(rbind,lapply(split(ok,ok$cluster),function(z)head(z[order(-z$avg_log2FC,z$gene),],10)))
+  revision_write(top,'global_markers_top10_Bonferroni05',out)
+  if(full) {
+  revision_markers(s,'smc_leiden','SMC',out)
+  revision_smc_recluster(x,s,out)
+  revision_sensitivity(x,'leiden_global','global',c(20,30,40),c(15,20,30),c(.6,.8,1),out)
+  revision_sensitivity(s,'smc_leiden','SMC',c(5,10),c(15,20,30),c(.8,1,1.2),out)
+  }
+  writeLines('Completed archived-object evaluation; no ambient correction or new lineage validation claimed.',file.path(out,'COMPLETE.txt'))
+}
+# Corrected end-to-end discovery mode, separate from the manuscript-object audit.
+# New annotation/SMC inclusion requires cell-level review; historical cluster IDs are not reused.
+if (sys.nframe()==0L) {
+  args<-commandArgs(trailingOnly=TRUE)
+  positional<-args[!grepl('^--',args)]
+  flags<-args[grepl('^--',args)]
+  if(any(!flags%in%c('--quick','--rebuild')))stop('Valid flags: --quick, --rebuild')
+  f<-sub('^--file=','',grep('^--file=',commandArgs(FALSE),value=TRUE))
+  root<-normalizePath(if(length(positional))positional[1] else
+    file.path(dirname(normalizePath(f)),'../..'),mustWork=TRUE)
+  local_lib<-file.path(root,'240724_new/R_library')
+  if(dir.exists(local_lib)).libPaths(c(local_lib,.libPaths()))
+  out<-file.path(root,'results_TMEM41B_review_20261022')
+  if('--rebuild'%in%flags){
+    cfg$samples<-data.frame(sample=c('HMY_KO1','HMY_KO2','HMY_WT1','HMY_WT2'),group=c('KO','KO','WT','WT'))
+    cfg$samples$path<-file.path(root,'240624',cfg$samples$sample)
+    cfg$output_dir<-file.path(out,'reporter_excluded_discovery');cfg$reference_clusters<-NULL
+    cfg$archive_rds<-NULL;cfg$use_archived_features<-FALSE;cfg$selection<-'strict'
+    # New cluster IDs receive provisional labels only. Manual annotation is required
+    # before applying a final SMC subset to a newly reconstructed clustering solution.
+    main(cfg)
+  }else revision_audit(root,out,full=!'--quick'%in%flags)
+}
